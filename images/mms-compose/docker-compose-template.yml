@@ -1,0 +1,211 @@
+version: '3.2'
+
+# Generated on ${generated.format('dd-MM-yyyy')}
+
+services:
+  alfresco:
+    image: ${project.dockerGroup}/mms-repo:${project.version}
+    container_name: ${project.containerNamePrefix}-mms
+    environment:
+      - CATALINA_OPTS=-Xmx1G -XX:+UseConcMarkSweepGC
+      - MMS_DB_USER=mms
+      - MMS_DB_PASSWORD=mmspass
+      - MMS_DB=mms
+      - ALFRESCO_DB_USER=mms
+      - ALFRESCO_DB_PASSWORD=mmspass
+      - ALFRESCO_DB=alfresco
+        # no value provided as we need to get this from the environment (host specific)
+        # this passes it through to the container instance
+      - ACTIVEMQ_EXTERNAL_FQDN
+        # the VE js code calculates the 2nd port by - 2 -> 61614
+        # ve-3.5.1's ./src/services/StompService.js has 61614 hardcoded as endpoint port :-(
+        # so that means nginx listening port must be same
+      - ACTIVEMQ_JMS_PORT=61616 # we know this one (minus 2) == port VE uses via wss
+    depends_on:
+      - postgresql
+      - activemq
+      - elastic
+      - solr
+    networks:
+      internal:
+          aliases:
+             - \${ACTIVEMQ_EXTERNAL_FQDN}
+             # - we need to set at least the jms.uri property to be an externally
+             # resolvable hostname - resolvable by user's browser - if using nginx as a gateway for wss -> ws usage,
+             # the EXTERNAL_FQDN needs to be the nginx host.
+             # at build time, we need to escape the reference. The Gradle Copy.expand() method will pass the 
+             # reference through minus the leading backslash so it can be used by docker-compose via --env or .env
+             # Note: this file is a groovy template. as such, these yaml comments are still processed by the 
+             # groovy template processing engine. So don't use a backslash within comments as it confuses the sh*t
+             # out of groovy, causing the gradle build to fail. It happened, hence the use of the word 'backslash' rather than
+             # the character itself.
+    ports:
+      - 8080:8080
+    volumes:
+      - alf_logs:/usr/local/tomcat/logs
+      - alfresco-data-volume:/opt/alf_data
+    tmpfs:
+      - /tmp
+      - /usr/local/tomcat/temp/
+      - /usr/local/tomcat/work/
+
+  solr:
+    image: ${project.dockerGroup}/mms-solr:${project.version}
+    container_name: ${project.containerNamePrefix}-solr
+    environment:
+      CATALINA_OPTS: "-Xmx1G -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:G1HeapRegionSize=8m -XX:MaxGCPauseMillis=200"
+    networks:
+      - internal
+    volumes:
+      - alf_logs:/usr/local/tomcat/logs/
+      - alfresco-data-volume:/opt/alf_data
+    tmpfs:
+      - /tmp
+      - /usr/local/tomcat/temp/
+      - /usr/local/tomcat/work/
+
+  activemq:
+    image: ${project.dockerGroup}/mms-activemq:${project.version}
+    container_name: ${project.containerNamePrefix}-activemq
+    ports:
+      # if we use nginx as a 'SSL terminator' reverse proxy, have nginx proxy_pass to 62614
+      # our published port (for VE, etc.) will be the nginx port (62614 is a good choice?)
+      - 62613:62613
+      - 62614:62614
+      - 62616:62616
+      - 1983:1983
+      - 5772:5772
+      - 8161:8161
+    volumes:
+      - activemq-data-volume:/data/activemq
+      - activemq-log-volume:/var/log/activemq
+      - activemq-conf-volume:/opt/activemq/conf
+    environment:
+      - ACTIVEMQ_ADMIN_LOGIN admin
+      - ACTIVEMQ_ADMIN_PASSWORD admin
+        # port VE will connect to (should be nginx proxy listening port)
+      - ACTIVEMQ_NGINX_PORT=61614
+      - ACTIVEMQ_NGINX_PORT2=61616
+        # these are ports that ActiveMQ listen for - only nginx should be creating connections to these endpoints
+        # these are defined here so the activemq's update_properties.sh can update the internal config files
+      - ACTIVEMQ_WS_PORT=62614
+      - ACTIVEMQ_STOMP_PORT=62613
+      - ACTIVEMQ_OPENWIRE_PORT=62616
+      - ACTIVEMQ_AMQP_PORT=5772
+      - ACTIVEMQ_MQTT_PORT=1983
+    networks:
+     internal:
+          aliases:
+             - \${ACTIVEMQ_EXTERNAL_FQDN}
+             # - we need to set at least the jms.uri property to be an externally
+             # resolvable hostname - done by user's browser
+             # at build time, we need to escape the reference
+
+  elastic:
+    image: ${project.dockerGroup}/mms-elastic:${project.version}
+    container_name: ${project.containerNamePrefix}-elastic
+    environment:
+      CLEAN: 'false'
+    ports:
+      - 9200:9200
+    volumes:
+      - elastic-data-volume:/var/data
+    networks:
+      - internal
+
+  postgresql:
+    image: ${project.dockerGroup}/mms-postgres:${project.version}
+    container_name: ${project.containerNamePrefix}-postgres
+    volumes:
+       - postgres-data-volume:/var/lib/postgresql/data
+    environment:
+      - MMS_DB_USER=mms
+      - MMS_DB_PASSWORD=mmspass
+      - MMS_DB=mms
+      - ALFRESCO_DB_USER=mms
+      - ALFRESCO_DB_PASSWORD=mmspass
+      - ALFRESCO_DB=alfresco
+    networks:
+      - internal
+
+  nginx:
+    image: ${project.dockerGroup}/mms-nginx:${project.version}
+    container_name: ${project.containerNamePrefix}-nginx
+    depends_on:
+     - activemq
+    environment:
+      # the broker's endpoint used by the reverse proxy (nginx)
+      - ACTIVEMQ_NGINX_URL='http://activemq:62614'
+      # the port nginx listens for wss client connections on to pass to ActiveMQ
+      - ACTIVEMQ_NGINX_PORT=62614  # ActiveMQ ws channel as used by non-docker clients
+      - ACTIVEMQ_NGINX_PORT2=62616
+      # These are service endpoint ports (non-SSL: tcp, ws )
+      - ACTIVEMQ_WS_PORT=62614
+      - ACTIVEMQ_STOMP_PORT=62613
+      - ACTIVEMQ_OPENWIRE_PORT=62616
+      - ACTIVEMQ_AMQP_PORT=5772
+      - ACTIVEMQ_MQTT_PORT=1983
+        # no value provided as we need to get this from the environment (host specific)
+        # this passes it through to the container instance
+      - ACTIVEMQ_EXTERNAL_FQDN
+    ports:
+      - 61613:61613
+      - 61614:61614
+      - 61616:61616
+    #extra_hosts:    # if we are trying to access a non-container host, add that host IP here
+    # 1 way to avoid having to modify the built docker-compose.yml file is to hardcode a host
+    # path, let the deployment process copy/link the 4 required files to these locations.
+    volumes:
+      - type: bind
+        source: /usr/local/docker-dir/nginxCerts/host.key
+        target: /etc/nginx/cert/localhost_openssl_key.pem
+        read_only: true
+      - type: bind
+        source: /usr/local/docker-dir/nginxCerts/host-chain.crt
+        target: /etc/nginx/cert/localhost_openssl_cert.crt
+        read_only: true
+      - type: bind
+        source: /usr/local/docker-dir/nginxCerts/host-cacerts.pem
+        target: /etc/nginx/cert/localhost_openssl_cacerts.pem
+        read_only: true
+      - type: bind
+        source: /usr/local/docker-dir/nginxCerts/host-key_passphrases.txt
+        target: /etc/nginx/cert/localhost_openssl_key_passphrases.txt
+        read_only: true
+    depends_on:
+      - activemq
+    networks:
+      internal:
+          aliases:
+             - \${ACTIVEMQ_EXTERNAL_FQDN}
+             # - we need to set at least the jms.uri property to be an externally
+             # resolvable hostname - resolvable by user's browser - if using nginx as a gateway for wss -> ws usage,
+             # the ACTIVEMQ_EXTERNAL_FQDN needs to be the nginx host.
+             # at build time, we need to escape the reference. The Gradle Copy.expand() method will pass the
+             # reference through minus the leading backslash so it can be used by docker-compose via --env or .env
+             # Note: this file is a groovy template. as such, these yaml comments are still processed by the
+             # groovy template processing engine. So don't use a backslash within comments as it confuses the sh*t
+             # out of groovy, causing the gradle build to fail. It happened, hence the use of the word 'backslash' rather than
+             # the character itself.
+
+
+volumes:
+  alf_logs:
+    external: true
+  alfresco-data-volume:
+    external: true
+  postgres-data-volume:
+    external: true
+  activemq-data-volume:
+    external: true
+  activemq-log-volume:
+    external: true
+  activemq-conf-volume:
+    external: true
+  elastic-data-volume:
+    external: true
+  nginx-external-volume:
+    external: true
+
+networks:
+  internal:
